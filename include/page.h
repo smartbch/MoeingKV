@@ -4,39 +4,42 @@
 #include <string>
 #include <string.h>
 #include <unistd.h>
-#include "bloomfilter256.h"
+#include <algorithm>
+#include "bloomfilter.h"
 #include "bitarray.h"
 
-namespace chainkv {
+namespace moeingkv {
 
 enum __page_size_t {
 	PAGE_SIZE = 4096,
+	PAGE_INIT_SIZE = 8,
 };
 
 struct kv_pair {
 	int64_t     id;
 	uint64_t    key;
-	std::string value;
-	int size() {
-		int res = 4/*offset*/ + 8/*key*/ + 8/*id*/ + value.size();
-		assert(res + 8 <= PAGE_SIZE);
-		return res;
+	dual_string value;
+	size_t size() const {
+		return 2/*offset*/ + 8/*id*/ + 8/*key*/ + 4/*two lengths*/ + value.size();
 	}
 };
 
 class page {
-	std::array<uint8_t, PAGE_SIZE> arr;
-	void write_u32(size_t offset, uint32_t v) {
-		uint32_t* u32ptr = reinterpret_cast<uint32_t*>(arr.data()+offset);
-		*u32ptr = v;
+	std::array<char, PAGE_SIZE> arr;
+	void write_u16(size_t offset, uint16_t v) {
+		uint16_t* u16ptr = reinterpret_cast<uint16_t*>(arr.data()+offset);
+		*u16ptr = v;
 	}
-	uint32_t read_u32(size_t offset) {
-		uint32_t* u32ptr = reinterpret_cast<uint32_t*>(arr.data()+offset);
-		return *u32ptr;
+	uint16_t read_u16(size_t offset) {
+		uint16_t* u16ptr = reinterpret_cast<uint16_t*>(arr.data()+offset);
+		return *u16ptr;
 	}
 	void write_i64(size_t offset, int64_t v) {
 		int64_t* i64ptr = reinterpret_cast<int64_t*>(arr.data()+offset);
 		*i64ptr = v;
+	}
+	void write_str(size_t offset, const std::string& s) {
+		memcpy(arr.data()+offset, s.data(), s.size());
 	}
 	int64_t read_i64(size_t offset) {
 		int64_t* i64ptr = reinterpret_cast<int64_t*>(arr.data()+offset);
@@ -50,59 +53,77 @@ class page {
 		uint64_t* u64ptr = reinterpret_cast<uint64_t*>(arr.data()+offset);
 		return *u64ptr;
 	}
+	void read_str(size_t offset, std::string* s, size_t size) {
+		*s = std::string(arr.data()+offset, size);
+	}
 public:
-	uint8_t* data() {
+	char* data() {
 		return arr.data();
 	}
 	void fill_with(const std::vector<kv_pair>& in_list) {
+		uint16_t value_pos = PAGE_INIT_SIZE + (2+8) * in_list.size();
 		size_t start = 0;
-		uint32_t value_pos = 4/*count*/ + 4/*ending*/ + 20 * in_list.size();
-		write_u32(start, uint32_t(in_list.size()));
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
-			write_u32(start, value_pos);
-			value_pos += iter->value.size();
-			start += 4;
-			write_u64(start, iter->key);
-			start += 8;
-			write_i64(start, iter->id);
-			start += 8;
+			write_u64(start, iter->key); start += 8;
 		}
-		write_u32(start, value_pos);
-		start += 4;
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
-			memcpy(arr.data(), iter->value.data(), iter->value.size());
-			start += iter->value.size();
+			write_u16(start, value_pos); start+=2;
+			value_pos += 8/*id*/ + 4/*two lengths*/ + iter->value.size();
+		}
+		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
+			write_i64(start, iter->id); start += 8;
+			write_u16(start, uint16_t(iter->value.first.size())); start += 2;
+			write_u16(start, uint16_t(iter->value.second.size())); start += 2;
+			write_str(start, iter->value.first); start += iter->value.first.size();
+			write_str(start, iter->value.second); start += iter->value.second.size();
 		}
 	}
-	bool read_at(int i, uint64_t* key, kv_pair* kv) {
-		auto key_pos = 4 + i*20 + 4;
-		kv->key = read_u64(key_pos);
-		if(key != nullptr && *key != kv->key) {
-			return false;
+	bool lookup(uint64_t key, const std::string& first_value, str_with_id* out, bitarray* del_mark) {
+		size_t count = read_u16(0);
+		uint64_t* keyptr_start = reinterpret_cast<uint64_t*>(arr.data()+PAGE_INIT_SIZE);
+		uint64_t* keyptr_end = keyptr_start + count;
+		uint64_t* keyptr = std::lower_bound(keyptr_start, keyptr_end, key);
+		for(; *keyptr == key; keyptr++) {
+			size_t idx = keyptr - keyptr_start;
+			size_t offset = PAGE_INIT_SIZE + 8 * count + 2 * idx;
+			size_t pos = read_u16(offset);
+			char* first_value_start = arr.data() + pos + 12;
+			size_t first_value_len = read_u16(pos + 8);
+			if(first_value_len != first_value.size() ||
+			   memcmp(first_value_start, first_value.data(), first_value_len) != 0) {
+				continue;
+			}
+			auto id = read_i64(pos);
+			if(!del_mark->get(id)) {
+				char* second_value_start = arr.data() + pos + 12 + first_value_len;
+				size_t second_value_len = read_u16(pos + 10);
+				out->str = std::string(second_value_start, second_value_len);
+				out->id = id;
+				return true;
+			}
 		}
-		int offset = read_u32(4 + i*20);
-		int next_offset = read_u32(4 + (i+1)*20);
-		kv->value = std::string(reinterpret_cast<const char*>(data() + offset), next_offset - offset);
-		kv->id = read_i64(4 + i*20 + 4 + 8);
-		return true;
-	}
-	kv_pair lookup(uint64_t key) {
-		kv_pair kv{.id=-1};
-		int count = read_u32(0);
-		for(int i=0; i<count; i++) {
-			if(read_at(i, &key, &kv)) break;
-		}
-		return kv;
+		return false;
 	}
 	void extract_to(std::vector<kv_pair>* vec, bitarray* del_mark) {
 		vec->clear();
-		kv_pair kv{.id=-1};
-		int count = read_u32(0);
-		for(int i=0; i<count; i++) {
-			read_at(i, nullptr, &kv);
-			if(!del_mark->get(kv.id)) {
-				vec->push_back(kv);
+		size_t count = read_u16(0);
+		uint64_t* keyptr_start = reinterpret_cast<uint64_t*>(arr.data()+PAGE_INIT_SIZE);
+		for(size_t idx = 0; idx < count; idx++) {
+			size_t offset = PAGE_INIT_SIZE + 8 * count + 2 * idx;
+			size_t pos = read_u16(offset);
+			kv_pair kv;
+			kv.id = read_i64(pos);
+			if(del_mark->get(kv.id)) {
+				continue;
 			}
+			char* first_value_start = arr.data() + pos + 12;
+			size_t first_value_len = read_u16(pos + 8);
+			char* second_value_start = arr.data() + pos + 12 + first_value_len;
+			size_t second_value_len = read_u16(pos + 10);
+			kv.key = keyptr_start[idx];
+			kv.value.first = std::string(first_value_start, first_value_len);
+			kv.value.second = std::string(second_value_start, second_value_len);
+			vec->push_back(kv);
 		}
 	}
 };
@@ -111,7 +132,7 @@ class kv_producer {
 public:
 	virtual kv_pair peek() = 0;
 	virtual kv_pair produce() = 0;
-	virtual bool has_more() = 0;
+	virtual bool valid() = 0;
 };
 
 class kv_consumer {
@@ -128,10 +149,10 @@ class merged_kv_producer {
 public:
 	merged_kv_producer(kv_producer* a, kv_producer* b): _a(a), _b(b) {}
 	kv_pair peek() {
-		if(!_a->has_more()) {
+		if(!_a->valid()) {
 			return _b->peek();
 		}
-		if(!_b->has_more()) {
+		if(!_b->valid()) {
 			return _a->peek();
 		}
 		if(_a->peek().key < _b->peek().key) {
@@ -140,10 +161,10 @@ public:
 		return _b->peek();
 	};
 	kv_pair produce() {
-		if(!_a->has_more()) {
+		if(!_a->valid()) {
 			return _b->produce();
 		}
-		if(!_b->has_more()) {
+		if(!_b->valid()) {
 			return _a->produce();
 		}
 		if(_a->peek().key < _b->peek().key) {
@@ -151,8 +172,8 @@ public:
 		}
 		return _b->produce();
 	};
-	bool has_more() {
-		return _a->has_more() || _b->has_more();
+	bool valid() {
+		return _a->valid() || _b->valid();
 	}
 };
 
@@ -182,7 +203,7 @@ public:
 		return pairs[pair_idx];
 	}
 	kv_pair produce() {
-		if(!has_more()) return kv_pair{};
+		if(!valid()) return kv_pair{};
 		auto kv = peek();
 		if(pair_idx < pairs.size()) {
 			pair_idx++;
@@ -191,7 +212,7 @@ public:
 		}
 		return kv;
 	}
-	bool has_more() {
+	bool valid() {
 		return offset <= end_offset || pair_idx < pairs.size();
 	}
 };
@@ -200,14 +221,14 @@ class kv_packer : public kv_consumer {
 	int fd;
 	std::vector<kv_pair> kv_list;
 	int used_size;
-	bloomfilter256* bf256;
+	bloomfilter* bf;
 	uint8_t col;
 public:
-	kv_packer(int fd, bloomfilter256* bf, uint8_t c): fd(fd), used_size(8), bf256(bf), col(c) {
+	kv_packer(int fd, bloomfilter* bf, uint8_t c): fd(fd), used_size(8), bf(bf), col(c) {
 		kv_list.reserve(100);
 	}
 	void consume(kv_pair kv) {
-		bf256->add_at(col, kv.key);
+		bf->add(kv.key);
 		used_size += kv.size();
 		if(used_size > PAGE_SIZE) {
 			flush();
