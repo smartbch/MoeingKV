@@ -8,13 +8,16 @@ public:
 	typedef btree::btree_multimap<uint64_t, dstr_with_id> i2str_map;
 private:
 	enum __const_t {
-		CLEAR_ROW = 66,
+		CLEAR_RANGE = 66,
 		ADD_KV = 68,
 	};
 
 	i2str_map m[ROW_COUNT];
 
 public:
+	size_t size_at_row(int row) {
+		return m[row].size();
+	}
 	bool get(uint64_t key, const std::string& first_value, str_with_id* out, bitarray* del_mark) {
 		auto row = row_from_key(key);
 		auto iter = m[row].find(key);
@@ -30,23 +33,38 @@ public:
 		}
 		return false;
 	}
-	void insert(uint64_t key, const dstr_with_id& value) {
+	void add(uint64_t key, const dstr_with_id& value) {
 		auto row = row_from_key(key);
 		m[row].insert(std::make_pair(key, value));
-		log_set_kv(key, value);
+		log_add_kv(key, value);
 	}
-	void swap(int row, i2str_map& new_for_row) {
-		m[row].swap(new_for_row);
-		log_clear_row(row);
-		for(auto iter = m[row].begin(); iter != m[row].end(); iter++) {
-			log_set_kv(iter->first, iter->second);
+	void clear_range(uint64_t key_start, uint64_t key_end) {
+		if(key_start == ~uint64_t(0)) {
+			return; //do nothing for empty range
+		}
+		auto row = row_from_key(key_start);
+		auto start = m[row].lower_bound(key_start);
+		auto end = m[row].lower_bound(key_end);
+		end++;
+		m[row].erase(start, end);
+		log_clear_range(key_start, key_end);
+	}
+	void log_range(uint64_t key_start, uint64_t key_end) {
+		auto row = row_from_key(key_start);
+		auto start = m[row].lower_bound(key_start);
+		auto end = m[row].lower_bound(key_end);
+		end++;
+		log_clear_range(key_start, key_end);
+		for(; start != end; start++) {
+			log_add_kv(start->first, start->second);
 		}
 	}
-	void log_clear_row(int row) {
-		curr_log.put(char(CLEAR_ROW));
-		log_u64(row_to_key(row));
+	void log_clear_range(uint64_t key_start, uint64_t key_end) {
+		curr_log.put(char(CLEAR_RANGE));
+		log_u64(key_start);
+		log_u64(key_end);
 	}
-	void log_set_kv(uint64_t key, const dstr_with_id& value) {
+	void log_add_kv(uint64_t key, const dstr_with_id& value) {
 		curr_log.put(char(ADD_KV));
 		log_u64(key);
 		log_i64(value.id);
@@ -72,9 +90,11 @@ public:
 					read_i64(fin, &value.id);
 					read_str(fin, &value.dstr.first);
 					read_str(fin, &value.dstr.second);
-					insert(key, value);
-				} else if(cmd == CLEAR_ROW) {
-					m[row].clear();
+					add(key, value);
+				} else if(cmd == CLEAR_RANGE) {
+					uint64_t key_end;
+					read_u64(fin, &key_end);
+					clear_range(key, key_end);
 				} else {
 					std::cerr<<"Unknown command: "<<cmd<<std::endl;
 					return false;
@@ -91,8 +111,16 @@ public:
 		i2str_map* m;
 		i2str_map::iterator iter;
 		bitarray* del_mark;
+		uint64_t start;
+		uint64_t end;
 		friend class freshmap;
 	public:
+		uint64_t key_start() {
+			return start;
+		}
+		uint64_t key_end() {
+			return end;
+		}
 		kv_pair peek() {
 			return kv_pair{
 				.id=iter->second.id,
@@ -105,6 +133,10 @@ public:
 			for(; iter != m->end(); iter++) {
 				if(!del_mark->get(iter->second.id)) break;
 			}
+			if(start == ~uint64_t(0)) {
+				start = res.key;
+			}
+			end = res.key;
 			return res;
 		}
 		bool valid() {
@@ -116,6 +148,8 @@ public:
 		res.m=&m[row];
 		res.iter=m[row].begin();
 		res.del_mark=del_mark;
+		res.start = ~uint64_t(0);
+		res.end = ~uint64_t(0);
 		return res;
 	}
 };

@@ -6,33 +6,29 @@
 
 namespace moeingkv {
 
-struct point {
-	int col;
-	int row;
-};
-
 inline uint64_t hashstr(const std::string& str, uint64_t seed) {
 	return XXHash64::hash(str.data(), str.size(), seed);
 }
 
 class internalkv {
+	uint64_t        young_top_key;
+	int             young_vault;
+	int             old_vault;
 	freshmap        fmap;
-	int             col_fd[256];
-	u64vec          col_index[256];
+	int             vault_fd[256];
+	u64vec          vault_index[256];
 	bloomfilter256* bf256[ROW_COUNT];
-	point           mov_pt;
 	bitarray        del_mark;
 	seeds*          seeds_for_bloom;
 
-	bloomfilter*        tmp_bf;
-	bloomfilter256*     new_bf256;
-	bloomfilter256*     old_bf256;
+	std::atomic_bool    stop_prepare_early;
+	uint64_t            new_young_top_key;
+	uint64_t            clear_young_key_end;
+	int                 incr_young_vault;
+	bloomfilter256*     new_bf256_for_next_row;
 	freshmap::i2str_map new_map;
-	std::atomic_bool         ok_to_compact;
 public:
 	internalkv(int count_for_bloom, seeds* s): seeds_for_bloom(s) {
-		mov_pt.col = 0;
-		mov_pt.row = 0;
 		for(int i=0; i<ROW_COUNT; i++) {
 			bf256[i] = new bloomfilter256(count_for_bloom, seeds_for_bloom);
 		}
@@ -47,49 +43,51 @@ public:
 	internalkv(internalkv&& other) = delete;
 	internalkv& operator=(internalkv&& other) = delete;
 
-	bool is_ok_to_compact() {
-		return ok_to_compact.load();
-	}
 	void commit_compaction() {
-		if(new_bf256 != nullptr) {
-			old_bf256 = bf256[mov_pt.row%ROW_COUNT];
-			bf256[mov_pt.row%ROW_COUNT] = new_bf256;
+		if(incr_young_vault) {
+			young_vault++;
+			old_vault++;
 		}
-		if(tmp_bf != nullptr) {
-			bf256[mov_pt.row%ROW_COUNT]->assign_at(uint8_t(mov_pt.col), tmp_bf);
+		if(young_top_key < clear_young_key_end) {
+			fmap.clear_range(young_top_key, clear_young_key_end);
 		}
-		fmap.swap(mov_pt.row%ROW_COUNT, new_map);
-		mov_pt.row++;
-		if(mov_pt.row == ROW_COUNT) {
-			mov_pt.row = 0;
-			mov_pt.col++;
-			del_mark.switch_log(mov_pt.col);
+		if(clear_young_key_end < new_young_top_key) {
+			fmap.log_range(clear_young_key_end, new_young_top_key);
 		}
-		fmap.switch_log(mov_pt.col*ROW_COUNT + mov_pt.row);
+		int next_row = (row_from_key(young_top_key) + 1) / ROW_COUNT;
+		delete bf256[next_row];
+		bf256[next_row] = new_bf256_for_next_row;
+		new_bf256_for_next_row = nullptr;
 	}
 	
 	bool get(uint64_t key, const std::string& first_value, str_with_id* out) {
 		if(fmap.get(key, first_value, out, &del_mark)) {
 			return true;
 		}
-		int row = row_from_key(key);
-		uint8_t gap_col = uint8_t(mov_pt.col);
-		if(row >= mov_pt.row) {
-			gap_col++;
+		int young = young_vault;
+		if(key > young_top_key) young--;
+		bits256 mask;
+		auto row = row_from_key(key);
+		bf256[row]->get_mask(key, mask);
+		std::vector<uint8_t> pos_list;
+		for(int i = 0; i < 255; i++) {
+			auto pos = young - i;
+			if(mask.get(pos)) {
+				pos_list.push_back(uint8_t(pos));
+			}
 		}
-		auto list = bf256[row]->get_pos_list(key, gap_col);
-		if(list.size == 0) {
+		if(pos_list.size() == 0) {
 			return false;
 		}
-		for(int i=0; i<list.size; i++) {
-			uint8_t col = list.data[i];
-			ssize_t pageid = col_index[col].search(key);
+		for(int i=0; i<pos_list.size(); i++) {
+			uint8_t vault_lsb = pos_list[i];
+			ssize_t pageid = vault_index[vault_lsb].search(key);
 			if(pageid < 0) {
 				continue; 
 			}
 			auto pageoff = pageid * PAGE_SIZE;
 			page pg;
-			auto sz = pread(col_fd[col], pg.data(), PAGE_SIZE, pageoff);
+			auto sz = pread(vault_fd[vault_lsb], pg.data(), PAGE_SIZE, pageoff);
 			assert(sz == PAGE_SIZE);
 			bool ok = pg.lookup(key, first_value, out, &del_mark);
 			if(ok) return true;
@@ -107,19 +105,19 @@ public:
 			data.dstr.first = iter->first;
 			data.dstr.second = iter->second.str;
 			data.id = iter->second.id;
-			fmap.insert(hashkey, data);
+			fmap.add(hashkey, data);
 		}
 		//TODO record metainfo (including log files' sizes)
 	}
-	void move_cell(uint8_t col, int row) {
-		ssize_t start = col_index[col].search(row_to_key(row)) * PAGE_SIZE;
+	void move_cell(uint8_t vault_lsb, int row) {
+		ssize_t start = vault_index[vault_lsb].search(row_to_key(row)) * PAGE_SIZE;
 		if(start < 0) start = 0;
-		ssize_t end = col_index[col].search(row_to_key(row+1)) * PAGE_SIZE;
+		ssize_t end = vault_index[vault_lsb].search(row_to_key(row+1)) * PAGE_SIZE;
 		if(end < 0) end = 0; //todo, maybe bug here
-		kv_reader reader(start, end, col_fd[col], &del_mark);
+		kv_reader reader(start, end, vault_fd[vault_lsb], &del_mark);
 		auto prod = fmap.get_kv_producer(row, &del_mark);
 		merged_kv_producer merger(&reader, &prod);
-		kv_packer packer(col_fd[col+1], tmp_bf, col+1);
+		kv_packer packer(vault_fd[vault_lsb+1], bf256[row], vault_lsb+1);
 		while(merger.valid()) {
 			packer.consume(merger.produce());
 		}

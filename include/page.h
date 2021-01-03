@@ -146,8 +146,26 @@ public:
 class merged_kv_producer {
 	kv_producer* _a;
 	kv_producer* _b;
+	uint64_t last_key;
+	bool never_produced;
+	kv_pair _produce() {
+		if(!_a->valid()) {
+			return _b->produce();
+		}
+		if(!_b->valid()) {
+			return _a->produce();
+		}
+		if(_a->peek().key < _b->peek().key) {
+			return _a->produce();
+		}
+		return _b->produce();
+	};
 public:
-	merged_kv_producer(kv_producer* a, kv_producer* b): _a(a), _b(b) {}
+	merged_kv_producer(kv_producer* a, kv_producer* b): _a(a), _b(b), never_produced(true) {}
+	bool in_middle_of_same_key() {
+		if(never_produced) return false;
+		return last_key == peek().key;
+	}
 	kv_pair peek() {
 		if(!_a->valid()) {
 			return _b->peek();
@@ -161,17 +179,11 @@ public:
 		return _b->peek();
 	};
 	kv_pair produce() {
-		if(!_a->valid()) {
-			return _b->produce();
-		}
-		if(!_b->valid()) {
-			return _a->produce();
-		}
-		if(_a->peek().key < _b->peek().key) {
-			return _a->produce();
-		}
-		return _b->produce();
-	};
+		never_produced = false;
+		auto res = _produce();
+		last_key = res.key;
+		return res;
+	}
 	bool valid() {
 		return _a->valid() || _b->valid();
 	}
@@ -221,14 +233,14 @@ class kv_packer : public kv_consumer {
 	int fd;
 	std::vector<kv_pair> kv_list;
 	int used_size;
-	bloomfilter* bf;
-	uint8_t col;
+	bloomfilter256* bf;
+	uint8_t vault_lsb;
 public:
-	kv_packer(int fd, bloomfilter* bf, uint8_t c): fd(fd), used_size(8), bf(bf), col(c) {
+	kv_packer(int fd, bloomfilter256* bf, uint8_t lsb): fd(fd), used_size(8), bf(bf), vault_lsb(lsb) {
 		kv_list.reserve(100);
 	}
 	void consume(kv_pair kv) {
-		bf->add(kv.key);
+		bf->add_at(vault_lsb, kv.key);
 		used_size += kv.size();
 		if(used_size > PAGE_SIZE) {
 			flush();
