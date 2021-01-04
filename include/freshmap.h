@@ -7,11 +7,6 @@ class freshmap: public ds_with_log {
 public:
 	typedef btree::btree_multimap<uint64_t, dstr_with_id> i2str_map;
 private:
-	enum __const_t {
-		CLEAR_RANGE = 66,
-		ADD_KV = 68,
-	};
-
 	i2str_map m[ROW_COUNT];
 
 public:
@@ -38,34 +33,7 @@ public:
 		m[row].insert(std::make_pair(key, value));
 		log_add_kv(key, value);
 	}
-	void clear_range(uint64_t key_start, uint64_t key_end) {
-		if(key_start == ~uint64_t(0)) {
-			return; //do nothing for empty range
-		}
-		auto row = row_from_key(key_start);
-		auto start = m[row].lower_bound(key_start);
-		auto end = m[row].lower_bound(key_end);
-		end++;
-		m[row].erase(start, end);
-		log_clear_range(key_start, key_end);
-	}
-	void log_range(uint64_t key_start, uint64_t key_end) {
-		auto row = row_from_key(key_start);
-		auto start = m[row].lower_bound(key_start);
-		auto end = m[row].lower_bound(key_end);
-		end++;
-		log_clear_range(key_start, key_end);
-		for(; start != end; start++) {
-			log_add_kv(start->first, start->second);
-		}
-	}
-	void log_clear_range(uint64_t key_start, uint64_t key_end) {
-		curr_log.put(char(CLEAR_RANGE));
-		log_u64(key_start);
-		log_u64(key_end);
-	}
 	void log_add_kv(uint64_t key, const dstr_with_id& value) {
-		curr_log.put(char(ADD_KV));
 		log_u64(key);
 		log_i64(value.id);
 		log_str(value.dstr.first);
@@ -81,24 +49,14 @@ public:
 				return false;
 			}
 			while((fin.rdstate() & std::ios::eofbit ) != 0) {
-				int cmd = fin.get();
 				uint64_t key;
 				read_u64(fin, &key);
 				auto row = row_from_key(key);
-				if(cmd == ADD_KV) {
-					dstr_with_id value;
-					read_i64(fin, &value.id);
-					read_str(fin, &value.dstr.first);
-					read_str(fin, &value.dstr.second);
-					add(key, value);
-				} else if(cmd == CLEAR_RANGE) {
-					uint64_t key_end;
-					read_u64(fin, &key_end);
-					clear_range(key, key_end);
-				} else {
-					std::cerr<<"Unknown command: "<<cmd<<std::endl;
-					return false;
-				}
+				dstr_with_id value;
+				read_i64(fin, &value.id);
+				read_str(fin, &value.dstr.first);
+				read_str(fin, &value.dstr.second);
+				add(key, value);
 				if((fin.rdstate() & std::ios::failbit ) != 0) {
 					std::cerr<<"Error when reading "<<fname<<std::endl;
 					return false;
