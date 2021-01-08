@@ -7,6 +7,7 @@
 #include <algorithm>
 #include "bloomfilter.h"
 #include "bitarray.h"
+#include "u64vec.h"
 
 namespace moeingkv {
 
@@ -57,18 +58,24 @@ class page {
 		*s = std::string(arr.data()+offset, size);
 	}
 public:
+	page(): arr() {}
+	page(const page& other) = delete;
+	page& operator=(const page& other) = delete;
+	page(page&& other) = delete;
+	page& operator=(page&& other) = delete;
+
 	char* data() {
 		return arr.data();
 	}
 	void fill_with(const std::vector<kv_pair>& in_list) {
-		uint16_t value_pos = PAGE_INIT_SIZE + (2+8) * in_list.size();
-		size_t start = 0;
+		size_t start = PAGE_INIT_SIZE;
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
 			write_u64(start, iter->key); start += 8;
 		}
+		uint16_t offset = start + 2 * in_list.size();
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
-			write_u16(start, value_pos); start+=2;
-			value_pos += 8/*id*/ + 4/*two lengths*/ + iter->value.size();
+			write_u16(start, offset); start+=2;
+			offset += 8/*id*/ + 4/*two lengths*/ + iter->value.size();
 		}
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
 			write_i64(start, iter->id); start += 8;
@@ -83,19 +90,19 @@ public:
 		uint64_t* keyptr_start = reinterpret_cast<uint64_t*>(arr.data()+PAGE_INIT_SIZE);
 		uint64_t* keyptr_end = keyptr_start + count;
 		uint64_t* keyptr = std::lower_bound(keyptr_start, keyptr_end, key);
-		for(; *keyptr == key; keyptr++) {
+		for(; *keyptr == key && keyptr != keyptr_end; keyptr++) {
 			size_t idx = keyptr - keyptr_start;
 			size_t offset = PAGE_INIT_SIZE + 8 * count + 2 * idx;
 			size_t pos = read_u16(offset);
-			char* first_value_start = arr.data() + pos + 12;
 			size_t first_value_len = read_u16(pos + 8);
+			char* first_value_start = arr.data() + pos + 12;
 			if(first_value_len != first_value.size() ||
 			   memcmp(first_value_start, first_value.data(), first_value_len) != 0) {
 				continue;
 			}
 			auto id = read_i64(pos);
-			if(!del_mark->get(id)) {
-				char* second_value_start = arr.data() + pos + 12 + first_value_len;
+			if(!del_mark->get(id)) { //not deleted
+				char* second_value_start = first_value_start + first_value_len;
 				size_t second_value_len = read_u16(pos + 10);
 				out->str = std::string(second_value_start, second_value_len);
 				out->id = id;
@@ -135,12 +142,6 @@ public:
 	virtual bool valid() = 0;
 };
 
-class kv_consumer {
-public:
-	virtual void consume(kv_pair kv) = 0;
-	virtual void flush() = 0;
-};
-
 // ============================
 
 class merged_kv_producer {
@@ -164,7 +165,7 @@ public:
 	merged_kv_producer(kv_producer* a, kv_producer* b): _a(a), _b(b), never_produced(true) {}
 	bool in_middle_of_same_key() {
 		if(never_produced) return false;
-		return last_key == peek().key;
+		return last_key == peek().key && valid();
 	}
 	kv_pair peek() {
 		if(!_a->valid()) {
@@ -219,42 +220,44 @@ public:
 		auto kv = peek();
 		if(pair_idx < pairs.size()) {
 			pair_idx++;
-		} else {
+		} else if(offset < end_offset) {
 			load_page();
 		}
 		return kv;
 	}
 	bool valid() {
-		return offset <= end_offset || pair_idx < pairs.size();
+		return offset < end_offset || (offset == end_offset && pair_idx < pairs.size());
 	}
 };
 
-class kv_packer : public kv_consumer {
-	int fd;
+class kv_packer {
+	int                  fd;
 	std::vector<kv_pair> kv_list;
-	int used_size;
-	bloomfilter256* bf;
-	uint8_t vault_lsb;
+	int                  used_size;
+	bloomfilter*         bf;
+	u64vec*              vec;
 public:
-	kv_packer(int fd, bloomfilter256* bf, uint8_t lsb): fd(fd), used_size(8), bf(bf), vault_lsb(lsb) {
+	kv_packer(int fd, bloomfilter* bf, u64vec* v):
+		fd(fd), used_size(PAGE_INIT_SIZE), bf(bf), vec(v) {
 		kv_list.reserve(100);
 	}
 	void consume(kv_pair kv) {
-		bf->add_at(vault_lsb, kv.key);
+		bf->add(kv.key);
 		used_size += kv.size();
-		if(used_size > PAGE_SIZE) {
-			flush();
-		}
 		kv_list.push_back(kv);
+	}
+	bool can_consume(kv_pair kv) {
+		return used_size + kv.size() < PAGE_SIZE;
 	}
 	void flush() {
 		if(kv_list.size() == 0) return;
+		vec->append(kv_list[0].key);
 		page pg;
 		pg.fill_with(kv_list);
 		auto sz = write(fd, pg.data(), PAGE_SIZE);
 		assert(sz == PAGE_SIZE);
 		kv_list.clear();
-		used_size = 8;
+		used_size = PAGE_INIT_SIZE;
 	}
 };
 

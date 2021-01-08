@@ -9,7 +9,23 @@ enum __const_t {
 
 	LEAF_BITS = 24,
 	LEAF_MASK = (1<<LEAF_BITS) - 1,
-	BYTE_COUNT = (1<<LEAF_BITS)/8,
+	U64_COUNT = (1<<LEAF_BITS)/64,
+
+	HASH_COUNT = 8,
+	BITS_PER_ENTRY = 20,
+};
+
+struct selector64 {
+	int n;
+	uint64_t mask;
+	selector64(int vault_lsb) {
+		n = vault_lsb/64;
+		mask = uint64_t(1) << uint64_t(vault_lsb%64);
+	}
+};
+
+struct seeds {
+	uint64_t u64[HASH_COUNT];
 };
 
 inline int row_from_key(uint64_t key) {
@@ -36,6 +52,19 @@ struct dual_string {
 struct dstr_with_id {
 	dual_string dstr;
 	int64_t     id;
+};
+
+union int64_or_b8 {
+	int64_t i64;
+	char b8[8];
+};
+union uint64_or_b8 {
+	uint64_t u64;
+	char b8[8];
+};
+union uint32_or_b4 {
+	uint32_t u32;
+	char b4[4];
 };
 
 }

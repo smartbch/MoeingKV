@@ -16,8 +16,8 @@ struct metainfo {
 };
 
 class moeingkv {
-	internalkv ikv;
-	metainfo meta;
+	internalkv        ikv;
+	metainfo          meta;
 	friend class moeingkv_batch;
 public:
 	bool get(const std::string& key, std::string* value) {
