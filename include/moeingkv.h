@@ -34,34 +34,29 @@ public:
 
 class moeingkv_batch {
 	moeingkv* parent;
-	btree::btree_set<int64_t> del_list;
-	btree::btree_map<std::string, str_with_id> new_map;
-	int64_t next_id;
+	btree::btree_multimap<uint64_t, dstr_with_id> new_map;
 public:
-	void put(const std::string& key, const std::string& value) {
-		auto iter = new_map.find(key);
-		if(iter != new_map.end()) {
-			iter->second.str = value;
-			return;
+	void modify(const std::string& key, const std::string& value, bool is_del) {
+		uint64_t hashkey = hashstr(key, parent->meta.seed);
+		auto pos = new_map.end();
+		for(auto iter = new_map.find(hashkey); iter != new_map.end(); iter++) {
+			if(iter->second.dstr.first == key) {
+				pos = iter;
+				break;
+			}
 		}
-		str_with_id data;
-		bool found_it = parent->find(key, &data);
-		if(found_it) {
-			del_list.insert(data.id);
-		}
-		data.id = next_id++;
-		data.str = value;
-		new_map.insert(std::make_pair(key, data));
-	}
-	void erase(const std::string& key) {
-		if(new_map.count(key) != 0) {
-			new_map.erase(key);
-			return;
-		}
-		str_with_id data;
-		bool found_it = parent->find(key, &data);
-		if(found_it) {
-			del_list.insert(data.id);
+		if(pos != new_map.end()) { //has a just-inserted entry
+			if(is_del) {
+				new_map.erase(pos);
+			} else {
+				pos->second.dstr.second = value;
+			}
+		} else {
+			auto v = dstr_with_id{.id=1};
+			v.dstr.first = key;
+			v.dstr.second = key;
+			if(is_del) v.id = -1;
+			new_map.insert(std::make_pair(hashkey, v));
 		}
 	}
 };

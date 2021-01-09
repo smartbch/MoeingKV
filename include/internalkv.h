@@ -162,20 +162,32 @@ public:
 		}
 		return false;
 	}
-	void update(const btree::btree_multimap<uint64_t, dstr_with_id>& new_map) {
+	void update(btree::btree_multimap<uint64_t, dstr_with_id>* new_map) {
 		str_with_id str_and_id;
-		for(auto iter = new_map.begin(); iter != new_map.end(); iter++) {
+		std::vector<uint64_t> del_ids;
+		for(auto iter = new_map->begin(); iter != new_map->end(); iter++) {
 			bool is_del = iter->second.id < 0;
 			if(is_del) {
 				bool found_it = get(iter->first, iter->second.dstr.first, &str_and_id);
 				if(found_it) {
 					cache.mark_as_deleted(iter->first, iter->second.dstr.first);
-					del_mark.clear(str_and_id.id); //TODO walog
+					del_ids.push_back(str_and_id.id);
+					del_mark.log_clear(str_and_id.id);
 				}
 			} else {
-				auto v = iter->second;
+				auto& v = iter->second;
 				v.id = next_id++;
-				rw_map->add(iter->first, v); //TODO walog
+				cache.add(iter->first, v.dstr.first, v.dstr.second, v.id);
+				rw_map->log_add_kv(iter->first, v);
+			}
+		}
+		//TODO commit metainfo
+		for(int i=0; i < del_ids.size(); i++) {
+			del_mark.clear(del_ids[i]);
+		}
+		for(auto iter = new_map->begin(); iter != new_map->end(); iter++) {
+			if(iter->second.id >= 0) {
+				rw_map->add(iter->first, iter->second);
 			}
 		}
 	}

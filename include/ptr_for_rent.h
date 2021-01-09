@@ -10,7 +10,7 @@ class ptr_for_rent {
 	struct releasable {
 		std::atomic_ullong status;
 		T* ptr;
-		releasable(T* p): ptr(p), status(0) {}
+		releasable(T* p): status(0), ptr(p) {}
 		~releasable() {
 			delete ptr;
 		}

@@ -8,16 +8,6 @@ private:
 	typedef btree::btree_multimap<uint64_t, dstr_with_id> i2str_map;
 	i2str_map m[ROW_COUNT];
 
-	void _log_add_kv(uint64_t key, const dstr_with_id& value) {
-		log_u64(key);
-		log_i64(value.id);
-		log_str(value.dstr.first);
-		log_str(value.dstr.second);
-	}
-	void _add(uint64_t key, const dstr_with_id& value) {
-		auto row = row_from_key(key);
-		m[row].insert(std::make_pair(key, value));
-	}
 public:
 	freshmap(): m() {}
 	freshmap(const freshmap& other) = delete;
@@ -43,9 +33,15 @@ public:
 		}
 		return false;
 	}
+	void log_add_kv(uint64_t key, const dstr_with_id& value) {
+		log_u64(key);
+		log_i64(value.id);
+		log_str(value.dstr.first);
+		log_str(value.dstr.second);
+	}
 	void add(uint64_t key, const dstr_with_id& value) {
-		_add(key, value);
-		_log_add_kv(key, value);
+		auto row = row_from_key(key);
+		m[row].insert(std::make_pair(key, value));
 	}
 	bool load_data_from_log(const std::string& fname) {
 		std::ifstream fin;
@@ -57,12 +53,11 @@ public:
 		while((fin.rdstate() & std::ios::eofbit) != 0) {
 			uint64_t key;
 			read_u64(fin, &key);
-			auto row = row_from_key(key);
 			dstr_with_id value;
 			read_i64(fin, &value.id);
 			read_str(fin, &value.dstr.first);
 			read_str(fin, &value.dstr.second);
-			_add(key, value);
+			add(key, value);
 			if((fin.rdstate() & std::ios::failbit ) != 0) {
 				std::cerr<<"Error when reading "<<fname<<std::endl;
 				return false;
