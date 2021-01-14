@@ -7,14 +7,15 @@
 
 namespace moeingkv {
 
-inline uint64_t hashstr(const std::string& str, uint64_t seed) {
-	return XXHash64::hash(str.data(), str.size(), seed);
-}
-
+// A cache with N shards. Each shard has its own mutex and allows one accessor for one time.
+// With N shards, this cache can have many accessors who are accessing different shard.
+// It caches the KV pairs contained in the on-disk and in-mem vaults. Each cache entry has a 
+// timestamp to indicate its age. When a cache shard is full, we try to find an old enough
+// entry to evict.
 template<int N>
-class sharded_map {
+class sharded_cache {
 	enum {
-		EVICT_DRY_DIST = 10,
+		EVICT_TRY_DIST = 10,
 	};
 	struct dstr_id_time {
 		std::string kstr;
@@ -26,7 +27,8 @@ class sharded_map {
 	struct map {
 		i2str_map  m;
 		std::mutex mtx;
-		void lock() {
+		void lock() { 
+			//since each access to map would not take a long time, we keep waiting here
 			while(!mtx.try_lock()) {/*do nothing*/}
 		}
 		void unlock() {
@@ -35,7 +37,9 @@ class sharded_map {
 		size_t size() {
 			return m.size();
 		}
-		bool get(uint64_t key, const std::string& kstr, str_with_id* out_ptr) {
+		// Look up the corresponding 'str_with_id' for 'kstr'. 'key' must be short hash of 'key_str'
+		// Returns whether a valid 'out' is found.
+		bool lookup(uint64_t key, const std::string& kstr, str_with_id* out_ptr) {
 			lock();
 			bool res = false;
 			for(auto iter = m.find(key); iter != m.end(); iter++) {
@@ -49,16 +53,7 @@ class sharded_map {
 			unlock();
 			return res;
 		}
-		void mark_as_deleted(uint64_t key, const std::string& kstr) {
-			lock();
-			for(auto iter = m.find(key); iter != m.end(); iter++) {
-				if(iter->second.kstr == kstr) {
-					iter->second.id = -1;
-					break;
-				}
-			}
-			unlock();
-		}
+		// Insert a new entry to the cache or change the cached value, to keep sync with the vaults.
 		void add(uint64_t key, const dstr_id_time& value) {
 			lock();
 			bool found_it = false;
@@ -74,16 +69,17 @@ class sharded_map {
 			}
 			unlock();
 		}
+		// Start iterating from rand_key for EVICT_TRY_DIST steps to find an oldest entry and evict it
 		void evict_oldest(uint64_t rand_key) {
 			lock();
-			auto del_pos = m.end();
-			int64_t timestamp = -1;
+			auto del_pos = m.end(); //pointing to the position for eviction
+			int64_t smallest_time = -1;
 			int dist = 0;
 			for(auto iter = m.lower_bound(rand_key); iter != m.end(); iter++) {
-				if(dist++ > EVICT_DRY_DIST) break;
-				if(timestamp == -1 || timestamp > iter->second.timestamp) {
+				if(dist++ > EVICT_TRY_DIST) break;
+				if(smallest_time == -1 || smallest_time > iter->second.timestamp) {
 					del_pos = iter;
-					timestamp = iter->second.timestamp;
+					smallest_time = iter->second.timestamp;
 				}
 			}
 			if(del_pos != m.end()) {
@@ -104,21 +100,21 @@ public:
 	void set_shard_max_size(size_t sz) {
 		shard_max_size = sz;
 	}
-	bool get(uint64_t key, const std::string& kstr, str_with_id* out_ptr) {
+	// lookup a cache entry. 'key' must be short hash of 'key_str'
+	bool lookup(uint64_t key, const std::string& key_str, str_with_id* out_ptr) {
 		rand_key.fetch_xor(key);
-		return map_arr[key%N].get(key, kstr, out_ptr);
+		return map_arr[key%N].lookup(key, key_str, out_ptr);
 	}
+	// Add a new cache entry and if the shard is full, evict the oldest
 	void add(uint64_t key, const std::string& kstr, const std::string& vstr, int64_t id) {
 		auto value = dstr_id_time{.kstr=kstr, .vstr=vstr, .id=id, .timestamp=timestamp};
-		if(map_arr[key%N].size() > shard_max_size) {
-			map_arr[key%N].evict_oldest(rand_key.load());
+		auto idx = key%N;
+		if(map_arr[idx].size() > shard_max_size) {
+			rand_key.store(hash(rand_key.load(), key));
+			map_arr[idx].evict_oldest(rand_key.load());
 		}
-		map_arr[key%N].add(key, value);
+		map_arr[idx].add(key, value);
 	}
-	void mark_as_deleted(uint64_t key, const std::string& kstr) {
-		map_arr[key%N].mark_as_deleted(key, kstr);
-	}
-
 };
 
 //unsigned long milliseconds_since_epoch =

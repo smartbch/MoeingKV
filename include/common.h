@@ -4,34 +4,47 @@
 namespace moeingkv {
 
 enum __const_t {
-	ROW_COUNT = 256,
-	ROW_BITS = 12,
+	COL_COUNT = 256,
 
-	LEAF_BITS = 24,
-	LEAF_MASK = (1<<LEAF_BITS) - 1,
-	U64_COUNT = (1<<LEAF_BITS)/64,
+	ROW_COUNT = 256,
+	ROW_BITS = 8,
 
 	HASH_COUNT = 8,
 	BITS_PER_ENTRY = 20,
 };
 
+#define MEM_VAULT_LOG_DIR ("mvault")
+#define DISK_VAULT_DIR ("vault")
+#define DEL_LOG_DIR ("del")
+#define META_FILE ("meta.txt")
+
+// select a bit in u64 vector&array
 struct selector64 {
 	int n;
 	uint64_t mask;
-	selector64(int vault_lsb) {
-		n = vault_lsb/64;
-		mask = uint64_t(1) << uint64_t(vault_lsb%64);
+	selector64(int i) {
+		n = i/64;
+		mask = uint64_t(1) << uint64_t(i%64);
 	}
 };
 
+// hash seeds for bloomfilter
 struct seeds {
 	uint64_t u64[HASH_COUNT];
+	seeds(const seeds& other) {
+		for(int i=0; i<HASH_COUNT; i++) u64[i]=other.u64[i];
+	}
+	seeds() {
+		for(int i=0; i<HASH_COUNT; i++) u64[i]=0;
+	}
 };
 
+// extract row id from key
 inline int row_from_key(uint64_t key) {
 	return int(key>>(64-ROW_BITS)) % ROW_COUNT;
 }
 
+// convert row id to key, filling unused bits to zero
 inline uint64_t row_to_key(int row) {
 	return uint64_t(row)<<(64-ROW_BITS);
 }
@@ -44,10 +57,14 @@ struct str_with_id {
 struct dual_string {
 	std::string first;
 	std::string second;
-	int size() const {
-		return first.size() + second.size();
-	}
 };
+
+struct kv_pair {
+	int64_t     id;
+	uint64_t    key;
+	dual_string value;
+};
+
 
 struct dstr_with_id {
 	dual_string dstr;

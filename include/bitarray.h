@@ -8,6 +8,9 @@
 
 namespace moeingkv {
 
+// A very large vector of atomic pointers. Its internal memory is not continuous. Instead,
+// its uses multi-level tree structure. The ununsed parts (null pointers) are not allocated.
+// Its head part can be pruned.
 template<typename T>
 class large_atomic_ptr_vector {
 	struct leaf_node {
@@ -64,15 +67,13 @@ class large_atomic_ptr_vector {
 				auto ptr = ptr_arr[i].exchange(nullptr);
 				delete ptr;
 			}
-			if(n_sh < ptr_arr.size()) {
-				auto ptr = ptr_arr[n_sh].load();
-				ptr->prune_till(n&mask());
-			}
+			auto ptr = ptr_arr[n_sh].load();
+			ptr->prune_till(n&mask());
 		}
 	};
-	typedef node<leaf_node, 1> mid1_node;
-	typedef node<mid1_node, 2> mid2_node;
-	typedef node<mid2_node, 3> top_node;
+	typedef node<leaf_node, 1> mid1_node; //T* count: 2**16
+	typedef node<mid1_node, 2> mid2_node; //T* count: 2**24
+	typedef node<mid2_node, 3> top_node; //T* count: 2**32
 public:
 	top_node top;
 	T* get(int64_t i) const {
@@ -86,14 +87,19 @@ public:
 	}
 };
 
-// A virtually infinite bitarray. Its beginning part can be pruned. 
+// A virtually 2**54-entry bitarray. Its beginning part can be pruned. 
 // The default value for the bits is 0.
 class bitarray: public ds_with_log {
+	enum {
+		LEAF_BITS = 24, // 16 million bits, 2MByte
+		LEAF_MASK = (1<<LEAF_BITS) - 1,
+		U64_COUNT = (1<<LEAF_BITS)/64,
+	};
 	typedef std::array<std::atomic_ullong, U64_COUNT> arr_t;
 
 	static arr_t* get_empty_arr() {
 		auto a = new arr_t;
-		for(int i=0; i<a->size(); i++) {
+		for(int i = 0; i < a->size(); i++) {
 			a->at(i).store(0);
 		}
 		return a;
@@ -136,10 +142,10 @@ public:
 	void clear(int64_t pos) {
 		modify(pos, false, true);
 	}
-	void log_set(int64_t pos) {
+	void log_set(int64_t pos) { // positive for set
 		log_i64(pos);
 	}
-	void log_clear(int64_t pos) {
+	void log_clear(int64_t pos) { //negative for clear
 		log_i64(-pos);
 	}
 	void prune_till(int64_t pos) {

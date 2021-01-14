@@ -16,15 +16,7 @@ enum __page_size_t {
 	PAGE_INIT_SIZE = 8,
 };
 
-struct kv_pair {
-	int64_t     id;
-	uint64_t    key;
-	dual_string value;
-	size_t size() const {
-		return 2/*offset*/ + 8/*id*/ + 8/*key*/ + 4/*two lengths*/ + value.size();
-	}
-};
-
+// Raw memory of PAGE_SIZE bytes, which can be loaded from or stored to SSD directly. 
 class page {
 	std::array<char, PAGE_SIZE> arr;
 	void write_u16(size_t offset, uint16_t v) {
@@ -67,6 +59,7 @@ public:
 	char* data() {
 		return arr.data();
 	}
+	// fill the raw bytes with content in 'in_list'
 	void fill_with(const std::vector<kv_pair>& in_list) {
 		size_t start = PAGE_INIT_SIZE;
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
@@ -75,7 +68,8 @@ public:
 		uint16_t offset = start + 2 * in_list.size();
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
 			write_u16(start, offset); start+=2;
-			offset += 8/*id*/ + 4/*two lengths*/ + iter->value.size();
+			offset += 8/*id*/ + 4/*two lengths*/ +
+				iter->value.first.size() + iter->value.second.size();
 		}
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
 			write_i64(start, iter->id); start += 8;
@@ -85,7 +79,10 @@ public:
 			write_str(start, iter->value.second); start += iter->value.second.size();
 		}
 	}
-	bool lookup(uint64_t key, const std::string& first_value, str_with_id* out, bitarray* del_mark) {
+	// Look up the corresponding 'str_with_id' for 'key_str'. 'key' must be short hash of 'key_str'
+	// and its id must have not been marked as deleted in 'del_mark'. 
+	// Returns whether a valid 'out' is found.
+	bool lookup(uint64_t key, const std::string& key_str, str_with_id* out, bitarray* del_mark) {
 		size_t count = read_u16(0);
 		uint64_t* keyptr_start = reinterpret_cast<uint64_t*>(arr.data()+PAGE_INIT_SIZE);
 		uint64_t* keyptr_end = keyptr_start + count;
@@ -96,12 +93,13 @@ public:
 			size_t pos = read_u16(offset);
 			size_t first_value_len = read_u16(pos + 8);
 			char* first_value_start = arr.data() + pos + 12;
-			if(first_value_len != first_value.size() ||
-			   memcmp(first_value_start, first_value.data(), first_value_len) != 0) {
+			if(first_value_len != key_str.size() ||
+			   memcmp(first_value_start, key_str.data(), first_value_len) != 0) {
 				continue;
 			}
+			// Checking del_mark is time-consuming, so we only check it when key_str matches.
 			auto id = read_i64(pos);
-			if(!del_mark->get(id)) { //not deleted
+			if(!del_mark->get(id)) {
 				char* second_value_start = first_value_start + first_value_len;
 				size_t second_value_len = read_u16(pos + 10);
 				out->str = std::string(second_value_start, second_value_len);
@@ -111,6 +109,7 @@ public:
 		}
 		return false;
 	}
+	// Extract the kv pairs stored in current page out, except the ones marked as deleted in 'del_mark'
 	void extract_to(std::vector<kv_pair>* vec, bitarray* del_mark) {
 		vec->clear();
 		size_t count = read_u16(0);
@@ -123,10 +122,10 @@ public:
 			if(del_mark->get(kv.id)) {
 				continue;
 			}
-			char* first_value_start = arr.data() + pos + 12;
 			size_t first_value_len = read_u16(pos + 8);
-			char* second_value_start = arr.data() + pos + 12 + first_value_len;
 			size_t second_value_len = read_u16(pos + 10);
+			char* first_value_start = arr.data() + pos + 12;
+			char* second_value_start = first_value_start + first_value_len;
 			kv.key = keyptr_start[idx];
 			kv.value.first = std::string(first_value_start, first_value_len);
 			kv.value.second = std::string(second_value_start, second_value_len);
@@ -135,6 +134,7 @@ public:
 	}
 };
 
+// It produces a stream of sorted kv_pairs (keys from small to large)
 class kv_producer {
 public:
 	virtual kv_pair peek() = 0;
@@ -144,6 +144,8 @@ public:
 
 // ============================
 
+// It merges kv_pair streams from two kv_producer into one stream, while keeping keys'
+// increasing order.
 class merged_kv_producer {
 	kv_producer* _a;
 	kv_producer* _b;
@@ -190,11 +192,11 @@ public:
 	}
 };
 
-
+// It reads kv_pairs from the pages in a vault
 class kv_reader : public kv_producer {
-	int fd;
-	size_t offset;
-	size_t end_offset;
+	int fd; // file descriptor of the vault
+	size_t offset; // start position for reading
+	size_t end_offset; // end position for reading
 	std::vector<kv_pair> pairs;
 	int pair_idx;
 	bitarray* del_mark;
@@ -230,9 +232,11 @@ public:
 	}
 };
 
+// It packs a kv_pair stream into pages and store them to vault file
+// The first keys of these pages are recorded in 'vec'
 class kv_packer {
 	int                  fd;
-	std::vector<kv_pair> kv_list;
+	std::vector<kv_pair> kv_list; // a cache for pending kv_pair
 	int                  used_size;
 	bloomfilter*         bf;
 	u64vec*              vec;
@@ -241,14 +245,21 @@ public:
 		fd(fd), used_size(PAGE_INIT_SIZE), bf(bf), vec(v) {
 		kv_list.reserve(100);
 	}
-	void consume(kv_pair kv) {
+	size_t size_of_kv_pair(const kv_pair& kv) {
+		return 2/*offset*/ + 8/*id*/ + 8/*key*/ + 4/*two lengths*/ +
+			kv.value.first.size() + kv.value.second.size();
+	}
+	// consume a kv_pair and store it in cache
+	void consume(const kv_pair& kv) {
 		bf->add(kv.key);
-		used_size += kv.size();
+		used_size += size_of_kv_pair(kv);
 		kv_list.push_back(kv);
 	}
-	bool can_consume(kv_pair kv) {
-		return used_size + kv.size() < PAGE_SIZE;
+	// Returns whether current page can consume 'kv', if not, you must run 'flush' first.
+	bool can_consume(const kv_pair& kv) {
+		return used_size + size_of_kv_pair(kv) < PAGE_SIZE;
 	}
+	// flush the cache into disk
 	void flush() {
 		if(kv_list.size() == 0) return;
 		vec->append(kv_list[0].key);

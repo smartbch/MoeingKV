@@ -8,6 +8,15 @@
 
 namespace moeingkv {
 
+inline bool remove_file(const std::string fname) {
+	int res = remove(fname.c_str());
+	if(res != 0) {
+		std::cerr<<"Failed to delete "<<fname<<std::endl;
+		return false;
+	}
+	return true;
+}
+
 // truncate an existing log file, removing its useless ending part
 inline bool truncate_log(const std::string& log_dir, int num, off_t length) {
 	std::string fname = log_dir+"/"+std::to_string(num);
@@ -41,7 +50,7 @@ inline bool get_log_nums(const std::string& log_dir, std::vector<int>* file_list
 	}
 
 	closedir(dp);
-	sort(file_list->begin(), file_list->end());
+	std::sort(file_list->begin(), file_list->end());
 	return parse_ok;
 }
 
@@ -51,11 +60,7 @@ inline bool delete_useless_logs(const std::string& log_dir, const std::vector<in
 	for(int i=0; i<file_list.size(); i++) {
 		if(lo <= file_list[i] && file_list[i] < hi ) continue;
 		std::string fname = log_dir+"/"+std::to_string(file_list[i]);
-		int res = remove(fname.c_str());
-		if(res != 0) {
-			std::cerr<<"Failed to delete "<<fname<<std::endl;
-			return false;
-		}
+		if(!remove_file(fname)) return false;
 	}
 	return true;
 }
@@ -64,6 +69,7 @@ inline bool delete_useless_logs(const std::string& log_dir, const std::vector<in
 class ds_with_log {
 protected:
 	std::string log_dir;
+	std::string curr_log_fname;
 	std::ofstream curr_log;
 
 	void log_u32(uint32_t i) {
@@ -115,32 +121,37 @@ public:
 	void set_log_dir(const std::string& dir) {
 		log_dir = dir;
 	}
-	size_t flush_log() {
-		curr_log.flush();
-		return curr_log.tellp();
-	}
 	bool open_log(int num) {
-		std::string fname = log_dir+"/"+std::to_string(num);
+		curr_log_fname = log_dir+"/"+std::to_string(num);
 		if(curr_log.is_open()) {
 			std::cerr<<"The log file is already opened."<<std::endl;
 			return false;
 		}
-		curr_log.open(fname.c_str(), std::ios::out | std::ios::app | std::ios::binary);
+		curr_log.open(curr_log_fname.c_str(), std::ios::out | std::ios::app | std::ios::binary);
 		if(!curr_log.is_open()) {
-			std::cerr<<"Failed to open log file: "<<fname<<std::endl;
+			std::cerr<<"Failed to open log file: "<<curr_log_fname<<std::endl;
 			return false;
 		}
 		return true;
 	}
+	void flush_log() {
+		curr_log.flush();
+	}
+	size_t log_file_size() {
+		return curr_log.tellp();
+	}
 	void close_log(int num) {
 		curr_log.close();
 	}
+	void remove_log() {
+		remove_file(curr_log_fname);
+	}
 	bool switch_log(int num) {
 		curr_log.close();
-		std::string fname = log_dir+"/"+std::to_string(num);
-		curr_log.open(fname.c_str(), std::ios::trunc | std::ios::app | std::ios::binary);
+		curr_log_fname = log_dir+"/"+std::to_string(num);
+		curr_log.open(curr_log_fname.c_str(), std::ios::trunc | std::ios::app | std::ios::binary);
 		if(!curr_log.is_open()) {
-			std::cerr<<"Failed to open log file: "<<fname<<std::endl;
+			std::cerr<<"Failed to open log file: "<<curr_log_fname<<std::endl;
 			return false;
 		}
 		return true;

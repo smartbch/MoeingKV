@@ -113,4 +113,7 @@ public:
 	}
 };
 
+#undef GUESS_UPPER
+#undef GUESS_LOWER
+
 }

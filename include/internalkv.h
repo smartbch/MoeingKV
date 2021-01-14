@@ -2,41 +2,45 @@
 #include <mutex>
 #include "u64vec.h"
 #include "ptr_for_rent.h"
-#include "freshmap.h"
-#include "sharded_map.h"
+#include "vault_in_mem.h"
+#include "sharded_cache.h"
 #include "cpp-btree-1.0.1/btree_set.h"
 
 namespace moeingkv {
 
+typedef std::array<ptr_for_rent<bloomfilter256>, ROW_COUNT> bf256arr_t;
+
 class compactor {
 	friend class internalkv;
-	freshmap*       new_map;
-	freshmap*       ro_map;
-	u64vec*         old_vault_index;
-	u64vec*         new_vault_index;
-	int             new_vault_fd;
-	int             old_vault_fd;
-	uint8_t         new_vault_lsb;
-	bitarray*       del_mark;
-	seeds*          seeds_for_bloom;
-
-	std::array<ptr_for_rent<bloomfilter256>, ROW_COUNT>* bf256arr;
+	vault_in_mem*    wo_vault; // a write-only vault
+	vault_in_mem*    ro_vault; // a read-only vault
+	u64vec*          old_vault_index;
+	int              old_vault_fd;
+	u64vec*          new_vault_index;
+	int              new_vault_fd;
+	uint8_t          new_vault_lsb;
+	bitarray*        del_mark;
+	seeds*           seeds_for_bloom;
+	bf256arr_t*      bf256arr;
 	std::atomic_bool done;
+	// check the size of the bloomfilter at 'row', if it is too small, replaced it with a double-sized one
 	size_t check_bloomfilter_size(int row) {
 		size_t size;
-		bf256arr->at(row).rent_const([&size](const bloomfilter256* curr_bf) {
+		bloomfilter256* bf = nullptr; // a 2x enlarged bloomfilter
+		bf256arr->at(row).rent_const([&size, &bf, this, row](const bloomfilter256* curr_bf) {
 			size = curr_bf->size();
-		});
-		if(size < 2 * BITS_PER_ENTRY * ro_map->size_at_row(row)) {
-			bloomfilter256* bf; // an enlarged bloomfilter
-			bf256arr->at(row).rent_const([&bf](const bloomfilter256* curr_bf) {
+			if(size < 2 * BITS_PER_ENTRY * this->ro_vault->size_at_row(row)) {
 				bf = curr_bf->double_sized();
-			});
+				size *= 2;
+			}
+		});
+		if(bf != nullptr) {
 			bf256arr->at(row).replace(bf);
-			size *= 2;
 		}
 		return size;
 	}
+	// compact one row of old vault and one row of ro_vault into one row of new vault.
+	// some entries which cannot be compacted, will be inserted to wo_vault. 
 	void compact_row(int row) {
 		size_t bloom_size = check_bloomfilter_size(row);
 		bloomfilter new_bf(bloom_size, seeds_for_bloom);
@@ -45,77 +49,137 @@ class compactor {
 		ssize_t end = old_vault_index->search(row_to_key(row+1)) * PAGE_SIZE;
 		assert(end >= 1);
 		kv_reader reader(start, end, old_vault_fd, del_mark);
-		auto prod = ro_map->get_kv_producer(row, del_mark);
+		auto prod = ro_vault->get_kv_producer(row, del_mark);
 		merged_kv_producer merger(&reader, &prod);
 		kv_packer packer(new_vault_fd, &new_bf, new_vault_index);
-		int64_t total = 0;
+		int64_t packed_num = 0;
 		bool bloom_is_full = false;
 		while(merger.valid()) {
 			auto kv = merger.produce();
-			if(bloom_is_full) {
-				new_map->add(kv.key, dstr_with_id{.dstr=kv.value, .id=kv.id});
+			if(bloom_is_full) {// bloomfilter is full, so new entries go into wo_vault
+				wo_vault->add(kv.key, dstr_with_id{.dstr=kv.value, .id=kv.id});
 				continue;
 			}
-			if(bloom_size < BITS_PER_ENTRY * total) {
-				packer.flush();
-				bloom_is_full = true;
-			}
-			if(!packer.can_consume(kv)) {
-				packer.flush();
-				while(merger.in_middle_of_same_key()) {
-					new_map->add(kv.key, dstr_with_id{.dstr=kv.value, .id=kv.id});
+			if(!packer.can_consume(kv)) { //enough kv pairs for one page
+				packer.flush(); //flush the kv pairs to disk
+				while(merger.in_middle_of_same_key()) {// same key cannot span two pages
+					wo_vault->add(kv.key, dstr_with_id{.dstr=kv.value, .id=kv.id});
 					kv = merger.produce();
 				}
 			}
 			packer.consume(kv);
-			total++;
+			packed_num++;
+			if(bloom_size < BITS_PER_ENTRY * packed_num) {
+				packer.flush();
+				bloom_is_full = true;
+			}
 		}
-		if(!bloom_is_full) {
-			packer.flush();
-		}
+		packer.flush(); // it is a nop if already flushed
 
 		bf256arr->at(row).rent([&new_bf, this](bloomfilter256* curr_bf) {
 			curr_bf->assign_at(this->new_vault_lsb, &new_bf);
 		});
 	}
+	void compact() {
+		for(int i=0; i<ROW_COUNT; i++) {
+			compact_row(i);
+		}
+		done.store(true);
+	}
 };
 
 class internalkv {
+	std::string     data_dir;
 	int             young_vault;
 	int             old_vault;
-	freshmap*       rw_map;
-	freshmap*       ro_map;
-	int             vault_fd[256];
-	u64vec          vault_index[256];
+	vault_in_mem*   rw_vault;
+	vault_in_mem*   ro_vault;
+	int             vault_fd[COL_COUNT];
+	u64vec          vault_index[COL_COUNT];
 	bitarray        del_mark;
-	seeds*          seeds_for_bloom;
+	seeds           seeds_for_bloom;
 
-	sharded_map<1024> cache;
+	compactor       compactor;
+
+	sharded_cache<1024> cache;
 	std::array<ptr_for_rent<bloomfilter256>, ROW_COUNT> bf256arr;
 	int64_t next_id;
-public:
-	internalkv(int count_for_bloom, seeds* s): seeds_for_bloom(s) {
-		for(int i=0; i<ROW_COUNT; i++) {
-			bf256arr[i].replace(new bloomfilter256(count_for_bloom, seeds_for_bloom));
+
+	//void set_log_dir(const std::string& dir) {
+	//bool open_log(int num) {
+	void init_compactor() {
+		compactor.wo_vault = new vault_in_mem;
+		compactor.wo_vault->set_log_dir(data_dir+MEM_VAULT_LOG_DIR);
+		compactor.wo_vault->open_log(young_vault+1);
+		compactor.ro_vault = ro_vault;
+		compactor.new_vault_lsb = (young_vault+1)%COL_COUNT;
+		compactor.new_vault_index = &vault_index[compactor.new_vault_lsb];
+		compactor.new_vault_fd = vault_fd[compactor.new_vault_lsb];
+		compactor.old_vault_index = &vault_index[old_vault%COL_COUNT];
+		compactor.old_vault_fd = vault_fd[old_vault%COL_COUNT];
+		compactor.del_mark = &del_mark;
+		compactor.seeds_for_bloom = &seeds_for_bloom;
+		compactor.bf256arr = &bf256arr;
+		compactor.done.store(false);
+	}
+	void done_compaction() {
+		ro_vault->remove_log();
+		delete ro_vault;
+		ro_vault = rw_vault;
+		rw_vault = compactor.wo_vault;
+
+		young_vault++;
+		del_mark.switch_log(young_vault);
+
+		close(vault_fd[old_vault%COL_COUNT]);
+		remove_file(data_dir+"/"+DISK_VAULT_DIR+"/"+std::to_string(old_vault));
+		old_vault++;
+	}
+	void save_meta() {
+		std::ofstream new_meta_file;
+		auto orig_meta_fname = data_dir+"/"+META_FILE;
+		auto new_meta_fname = orig_meta_fname+".new";
+		new_meta_file.open(new_meta_fname, std::ios::trunc | std::ios::app | std::ios::binary);
+		print_meta_to_file(new_meta_file);
+		new_meta_file.close();
+		rename(new_meta_fname.c_str(), orig_meta_fname.c_str());
+	}
+	void print_meta_to_file(std::ofstream& fout) {
+		fout<<"young_vault "<<young_vault<<std::endl;
+		fout<<"old_vault "<<young_vault<<std::endl;
+		fout<<"rw_vault_log_size "<<rw_vault->log_file_size()<<std::endl;
+		fout<<"del_log_size "<<del_mark.log_file_size()<<std::endl;
+		fout<<"bloomfilter_sizes"<<std::endl;
+		for(int row=0; row<ROW_COUNT; row++) {
+			bf256arr.at(row).rent_const([&fout](const bloomfilter256* curr_bf) {
+				auto size = curr_bf->size();
+				fout<<size<<std::endl;
+			});
 		}
-		rw_map = new freshmap;
-		ro_map = new freshmap;
+	}
+public:
+	internalkv(int count_for_bloom, const seeds& s): seeds_for_bloom(s) {
+		for(int i=0; i<ROW_COUNT; i++) {
+			bf256arr[i].replace(new bloomfilter256(count_for_bloom, &seeds_for_bloom));
+		}
+		rw_vault = new vault_in_mem;
+		ro_vault = new vault_in_mem;
 	}
 	~internalkv() {
-		delete rw_map;
-		delete ro_map;
+		delete rw_vault;
+		delete ro_vault;
 	}
 	internalkv(const internalkv& other) = delete;
 	internalkv& operator=(const internalkv& other) = delete;
 	internalkv(internalkv&& other) = delete;
 	internalkv& operator=(internalkv&& other) = delete;
 
-	bool get(uint64_t key, const std::string& first_value, str_with_id* out) {
-		if(cache.get(key, first_value, out)) {
+	bool lookup(uint64_t key, const std::string& first_value, str_with_id* out) {
+		if(cache.lookup(key, first_value, out)) {
 			if(out->id < 0) return false;
 			if(!del_mark.get(out->id)) return true;
 		}
-		bool res = _get(key, first_value, out);
+		bool res = _lookup(key, first_value, out);
 		if(res) {
 			cache.add(key, first_value, out->str, out->id);
 		} else {
@@ -123,14 +187,15 @@ public:
 		}
 		return res;
 	}
-	bool _get(uint64_t key, const std::string& first_value, str_with_id* out) {
-		if(rw_map->get(key, first_value, out, &del_mark)) {
+private:
+	bool _lookup(uint64_t key, const std::string& first_value, str_with_id* out) {
+		if(rw_vault->lookup(key, first_value, out, &del_mark)) {
 			return true;
 		}
-		if(ro_map->get(key, first_value, out, &del_mark)) {
+		if(ro_vault->lookup(key, first_value, out, &del_mark)) {
 			return true;
 		}
-		bits256 mask;
+		bitslice mask;
 		auto row = row_from_key(key);
 		bf256arr[row].rent_const([&key, &mask](const bloomfilter256* bf_ptr) {
 			bf_ptr->get_mask(key, mask);
@@ -162,15 +227,18 @@ public:
 		}
 		return false;
 	}
-	void update(btree::btree_multimap<uint64_t, dstr_with_id>* new_map) {
+public:
+	void update(btree::btree_multimap<uint64_t, dstr_with_id>* new_vault) {
+		if(compactor.done.load()) {
+			done_compaction();
+		}
 		str_with_id str_and_id;
 		std::vector<uint64_t> del_ids;
-		for(auto iter = new_map->begin(); iter != new_map->end(); iter++) {
+		for(auto iter = new_vault->begin(); iter != new_vault->end(); iter++) {
 			bool is_del = iter->second.id < 0;
 			if(is_del) {
-				bool found_it = get(iter->first, iter->second.dstr.first, &str_and_id);
+				bool found_it = lookup(iter->first, iter->second.dstr.first, &str_and_id);
 				if(found_it) {
-					cache.mark_as_deleted(iter->first, iter->second.dstr.first);
 					del_ids.push_back(str_and_id.id);
 					del_mark.log_clear(str_and_id.id);
 				}
@@ -178,16 +246,16 @@ public:
 				auto& v = iter->second;
 				v.id = next_id++;
 				cache.add(iter->first, v.dstr.first, v.dstr.second, v.id);
-				rw_map->log_add_kv(iter->first, v);
+				rw_vault->log_add_kv(iter->first, v);
 			}
 		}
-		//TODO commit metainfo
+		save_meta();
 		for(int i=0; i < del_ids.size(); i++) {
 			del_mark.clear(del_ids[i]);
 		}
-		for(auto iter = new_map->begin(); iter != new_map->end(); iter++) {
+		for(auto iter = new_vault->begin(); iter != new_vault->end(); iter++) {
 			if(iter->second.id >= 0) {
-				rw_map->add(iter->first, iter->second);
+				rw_vault->add(iter->first, iter->second);
 			}
 		}
 	}

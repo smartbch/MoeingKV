@@ -3,6 +3,10 @@
 
 namespace moeingkv {
 
+inline uint64_t hashstr(const std::string& str, uint64_t seed) {
+	return XXHash64::hash(str.data(), str.size(), seed);
+}
+
 struct metainfo {
 	uint64_t seed;
 	int64_t next_id;
@@ -28,7 +32,7 @@ public:
 	}
 	bool find(const std::string& key, str_with_id* out) {
 		uint64_t hashkey = hashstr(key, meta.seed);
-		return ikv.get(hashkey, key, out);
+		return ikv.lookup(hashkey, key, out);
 	}
 };
 
