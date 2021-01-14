@@ -13,10 +13,10 @@ namespace moeingkv {
 // a fix-sized bit slice
 class bitslice {
 	enum {
-		N = COL_COUNT/64,
+		N = VAULT_COUNT/64,
 	};
 	std::atomic_ullong d[N];
-	static_assert(COL_COUNT==64 || COL_COUNT==128 || COL_COUNT==256 || COL_COUNT==512, "invalid size");
+	static_assert(VAULT_COUNT==64 || VAULT_COUNT==128 || VAULT_COUNT==256 || VAULT_COUNT==512, "invalid size");
 public:
 
 	bitslice& operator|=(const bitslice& other) {

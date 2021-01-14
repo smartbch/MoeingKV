@@ -90,18 +90,18 @@ class compactor {
 
 class internalkv {
 	std::string     data_dir;
-	int             young_vault;
-	int             old_vault;
+	int             youngest_vault;
+	int             oldest_vault;
 	vault_in_mem*   rw_vault;
 	vault_in_mem*   ro_vault;
-	int             vault_fd[COL_COUNT];
-	u64vec          vault_index[COL_COUNT];
+	int             vault_fd[VAULT_COUNT];
+	u64vec          vault_index[VAULT_COUNT];
 	bitarray        del_mark;
 	seeds           seeds_for_bloom;
 
 	compactor       compactor;
 
-	sharded_cache<1024> cache;
+	sharded_cache<CACHE_SHARD_COUNT> cache;
 	std::array<ptr_for_rent<bloomfilter256>, ROW_COUNT> bf256arr;
 	int64_t next_id;
 
@@ -110,13 +110,13 @@ class internalkv {
 	void init_compactor() {
 		compactor.wo_vault = new vault_in_mem;
 		compactor.wo_vault->set_log_dir(data_dir+MEM_VAULT_LOG_DIR);
-		compactor.wo_vault->open_log(young_vault+1);
+		compactor.wo_vault->open_log(youngest_vault+1);
 		compactor.ro_vault = ro_vault;
-		compactor.new_vault_lsb = (young_vault+1)%COL_COUNT;
+		compactor.new_vault_lsb = (youngest_vault+1)%VAULT_COUNT;
 		compactor.new_vault_index = &vault_index[compactor.new_vault_lsb];
 		compactor.new_vault_fd = vault_fd[compactor.new_vault_lsb];
-		compactor.old_vault_index = &vault_index[old_vault%COL_COUNT];
-		compactor.old_vault_fd = vault_fd[old_vault%COL_COUNT];
+		compactor.old_vault_index = &vault_index[oldest_vault%VAULT_COUNT];
+		compactor.old_vault_fd = vault_fd[oldest_vault%VAULT_COUNT];
 		compactor.del_mark = &del_mark;
 		compactor.seeds_for_bloom = &seeds_for_bloom;
 		compactor.bf256arr = &bf256arr;
@@ -128,12 +128,12 @@ class internalkv {
 		ro_vault = rw_vault;
 		rw_vault = compactor.wo_vault;
 
-		young_vault++;
-		del_mark.switch_log(young_vault);
+		youngest_vault++;
+		del_mark.switch_log(youngest_vault);
 
-		close(vault_fd[old_vault%COL_COUNT]);
-		remove_file(data_dir+"/"+DISK_VAULT_DIR+"/"+std::to_string(old_vault));
-		old_vault++;
+		close(vault_fd[oldest_vault%VAULT_COUNT]);
+		remove_file(data_dir+"/"+DISK_VAULT_DIR+"/"+std::to_string(oldest_vault));
+		oldest_vault++;
 	}
 	void save_meta() {
 		std::ofstream new_meta_file;
@@ -145,8 +145,8 @@ class internalkv {
 		rename(new_meta_fname.c_str(), orig_meta_fname.c_str());
 	}
 	void print_meta_to_file(std::ofstream& fout) {
-		fout<<"young_vault "<<young_vault<<std::endl;
-		fout<<"old_vault "<<young_vault<<std::endl;
+		fout<<"youngest_vault "<<youngest_vault<<std::endl;
+		fout<<"oldest_vault "<<youngest_vault<<std::endl;
 		fout<<"rw_vault_log_size "<<rw_vault->log_file_size()<<std::endl;
 		fout<<"del_log_size "<<del_mark.log_file_size()<<std::endl;
 		fout<<"bloomfilter_sizes"<<std::endl;
@@ -202,7 +202,7 @@ private:
 		});
 		std::vector<uint8_t> pos_list;
 		for(int i = 0; i < 255; i++) {
-			auto pos = young_vault - i;
+			auto pos = youngest_vault - i;
 			if(mask.get(pos)) {
 				pos_list.push_back(uint8_t(pos));
 			}
@@ -237,7 +237,7 @@ public:
 		for(auto iter = new_vault->begin(); iter != new_vault->end(); iter++) {
 			bool is_del = iter->second.id < 0;
 			if(is_del) {
-				bool found_it = lookup(iter->first, iter->second.dstr.first, &str_and_id);
+				bool found_it = lookup(iter->first, iter->second.dstr.kstr, &str_and_id);
 				if(found_it) {
 					del_ids.push_back(str_and_id.id);
 					del_mark.log_clear(str_and_id.id);
@@ -245,7 +245,7 @@ public:
 			} else {
 				auto& v = iter->second;
 				v.id = next_id++;
-				cache.add(iter->first, v.dstr.first, v.dstr.second, v.id);
+				cache.add(iter->first, v.dstr.kstr, v.dstr.vstr, v.id);
 				rw_vault->log_add_kv(iter->first, v);
 			}
 		}

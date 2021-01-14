@@ -4,13 +4,15 @@
 namespace moeingkv {
 
 enum __const_t {
-	COL_COUNT = 256,
+	VAULT_COUNT = 256,
 
 	ROW_COUNT = 256,
 	ROW_BITS = 8,
 
 	HASH_COUNT = 8,
 	BITS_PER_ENTRY = 20,
+
+	CACHE_SHARD_COUNT = 1024,
 };
 
 #define MEM_VAULT_LOG_DIR ("mvault")
@@ -55,8 +57,8 @@ struct str_with_id {
 };
 
 struct dual_string {
-	std::string first;
-	std::string second;
+	std::string kstr;
+	std::string vstr;
 };
 
 struct kv_pair {

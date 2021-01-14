@@ -44,7 +44,7 @@ public:
 		uint64_t hashkey = hashstr(key, parent->meta.seed);
 		auto pos = new_map.end();
 		for(auto iter = new_map.find(hashkey); iter != new_map.end(); iter++) {
-			if(iter->second.dstr.first == key) {
+			if(iter->second.dstr.kstr == key) {
 				pos = iter;
 				break;
 			}
@@ -53,12 +53,12 @@ public:
 			if(is_del) {
 				new_map.erase(pos);
 			} else {
-				pos->second.dstr.second = value;
+				pos->second.dstr.vstr = value;
 			}
 		} else {
 			auto v = dstr_with_id{.id=1};
-			v.dstr.first = key;
-			v.dstr.second = key;
+			v.dstr.kstr = key;
+			v.dstr.vstr = key;
 			if(is_del) v.id = -1;
 			new_map.insert(std::make_pair(hashkey, v));
 		}

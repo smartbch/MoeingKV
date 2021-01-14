@@ -69,14 +69,14 @@ public:
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
 			write_u16(start, offset); start+=2;
 			offset += 8/*id*/ + 4/*two lengths*/ +
-				iter->value.first.size() + iter->value.second.size();
+				iter->value.kstr.size() + iter->value.vstr.size();
 		}
 		for(auto iter=in_list.begin(); iter != in_list.end(); iter++) {
 			write_i64(start, iter->id); start += 8;
-			write_u16(start, uint16_t(iter->value.first.size())); start += 2;
-			write_u16(start, uint16_t(iter->value.second.size())); start += 2;
-			write_str(start, iter->value.first); start += iter->value.first.size();
-			write_str(start, iter->value.second); start += iter->value.second.size();
+			write_u16(start, uint16_t(iter->value.kstr.size())); start += 2;
+			write_u16(start, uint16_t(iter->value.vstr.size())); start += 2;
+			write_str(start, iter->value.kstr); start += iter->value.kstr.size();
+			write_str(start, iter->value.vstr); start += iter->value.vstr.size();
 		}
 	}
 	// Look up the corresponding 'str_with_id' for 'key_str'. 'key' must be short hash of 'key_str'
@@ -127,8 +127,8 @@ public:
 			char* first_value_start = arr.data() + pos + 12;
 			char* second_value_start = first_value_start + first_value_len;
 			kv.key = keyptr_start[idx];
-			kv.value.first = std::string(first_value_start, first_value_len);
-			kv.value.second = std::string(second_value_start, second_value_len);
+			kv.value.kstr = std::string(first_value_start, first_value_len);
+			kv.value.vstr = std::string(second_value_start, second_value_len);
 			vec->push_back(kv);
 		}
 	}
@@ -247,7 +247,7 @@ public:
 	}
 	size_t size_of_kv_pair(const kv_pair& kv) {
 		return 2/*offset*/ + 8/*id*/ + 8/*key*/ + 4/*two lengths*/ +
-			kv.value.first.size() + kv.value.second.size();
+			kv.value.kstr.size() + kv.value.vstr.size();
 	}
 	// consume a kv_pair and store it in cache
 	void consume(const kv_pair& kv) {

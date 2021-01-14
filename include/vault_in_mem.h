@@ -29,9 +29,9 @@ public:
 	// Returns whether a valid 'out' is found.
 	bool lookup(uint64_t key, const std::string& key_str, str_with_id* out, bitarray* del_mark) {
 		auto row = row_from_key(key);
-		for(auto it = m[row].find(key); it != m[row].end() && it->second.dstr.first == key_str; it++) {
+		for(auto it = m[row].find(key); it != m[row].end() && it->second.dstr.kstr == key_str; it++) {
 			if(!del_mark->get(it->second.id)) {
-				out->str = it->second.dstr.second;
+				out->str = it->second.dstr.vstr;
 				out->id = it->second.id;
 				return true;
 			}
@@ -42,8 +42,8 @@ public:
 	void log_add_kv(uint64_t key, const dstr_with_id& value) {
 		log_u64(key);
 		log_i64(value.id);
-		log_str(value.dstr.first);
-		log_str(value.dstr.second);
+		log_str(value.dstr.kstr);
+		log_str(value.dstr.vstr);
 	}
 	// add new kv pair
 	void add(uint64_t key, const dstr_with_id& value) {
@@ -62,8 +62,8 @@ public:
 			read_u64(fin, &key);
 			dstr_with_id value;
 			read_i64(fin, &value.id);
-			read_str(fin, &value.dstr.first);
-			read_str(fin, &value.dstr.second);
+			read_str(fin, &value.dstr.kstr);
+			read_str(fin, &value.dstr.vstr);
 			add(key, value);
 			if((fin.rdstate() & std::ios::failbit ) != 0) {
 				std::cerr<<"Error when reading "<<fname<<std::endl;
