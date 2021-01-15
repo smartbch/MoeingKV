@@ -1,5 +1,6 @@
 #pragma once
 #include <mutex>
+#include <fcntl.h>
 #include "u64vec.h"
 #include "ptr_for_rent.h"
 #include "vault_in_mem.h"
@@ -108,54 +109,58 @@ class internalkv {
 	//void set_log_dir(const std::string& dir) {
 	//bool open_log(int num) {
 	void init_compactor() {
-		compactor.wo_vault = new vault_in_mem;
-		compactor.wo_vault->set_log_dir(data_dir+MEM_VAULT_LOG_DIR);
-		compactor.wo_vault->open_log(youngest_vault+1);
 		compactor.ro_vault = ro_vault;
-		compactor.new_vault_lsb = (youngest_vault+1)%VAULT_COUNT;
-		compactor.new_vault_index = &vault_index[compactor.new_vault_lsb];
-		compactor.new_vault_fd = vault_fd[compactor.new_vault_lsb];
-		compactor.old_vault_index = &vault_index[oldest_vault%VAULT_COUNT];
-		compactor.old_vault_fd = vault_fd[oldest_vault%VAULT_COUNT];
 		compactor.del_mark = &del_mark;
 		compactor.seeds_for_bloom = &seeds_for_bloom;
 		compactor.bf256arr = &bf256arr;
+
+		compactor.wo_vault = new vault_in_mem;
+		compactor.wo_vault->set_log_dir(data_dir+MEM_VAULT_LOG_DIR);
+		compactor.wo_vault->open_log(youngest_vault+4); // new log for mem vault is created
+
+		compactor.new_vault_lsb = (youngest_vault+1)%VAULT_COUNT;
+		compactor.new_vault_index = &vault_index[compactor.new_vault_lsb];
+		auto new_fname = data_dir+"/"+DISK_VAULT_DIR+"/"+std::to_string(youngest_vault+1);
+		compactor.new_vault_fd = open(new_fname.c_str(), O_RDWR); // new disk vault is created
+		vault_fd[compactor.new_vault_lsb] = compactor.new_vault_fd;
+
+		compactor.old_vault_index = &vault_index[oldest_vault%VAULT_COUNT];
+		compactor.old_vault_fd = vault_fd[oldest_vault%VAULT_COUNT];
 		compactor.done.store(false);
 	}
+	//void save_meta() {
+	//	std::ofstream new_meta_file;
+	//	auto orig_meta_fname = data_dir+"/"+META_FILE;
+	//	auto new_meta_fname = orig_meta_fname+".new";
+	//	new_meta_file.open(new_meta_fname, std::ios::trunc | std::ios::app | std::ios::binary);
+	//	print_meta_to_file(new_meta_file);
+	//	new_meta_file.close();
+	//	rename(new_meta_fname.c_str(), orig_meta_fname.c_str());
+	//}
+	//void print_meta_to_file(std::ofstream& fout) {
+	//	fout<<"youngest_vault "<<youngest_vault<<std::endl;
+	//	fout<<"oldest_vault "<<youngest_vault<<std::endl;
+	//	fout<<"rw_vault_log_size "<<rw_vault->log_file_size()<<std::endl;
+	//	fout<<"del_log_size "<<del_mark.log_file_size()<<std::endl;
+	//	fout<<"bloomfilter_sizes"<<std::endl;
+	//	for(int row=0; row<ROW_COUNT; row++) {
+	//		bf256arr.at(row).rent_const([&fout](const bloomfilter256* curr_bf) {
+	//			auto size = curr_bf->size();
+	//			fout<<size<<std::endl;
+	//		});
+	//	}
+	//}
 	void done_compaction() {
 		ro_vault->remove_log();
 		delete ro_vault;
 		ro_vault = rw_vault;
 		rw_vault = compactor.wo_vault;
 
-		youngest_vault++;
-		del_mark.switch_log(youngest_vault);
+		close(vault_fd[(oldest_vault-1)%VAULT_COUNT]);
+		remove_file(data_dir+"/"+DISK_VAULT_DIR+"/"+std::to_string(oldest_vault-1));
+		remove_file(data_dir+"/"+DEL_LOG_DIR+"/"+std::to_string(oldest_vault-1));
 
-		close(vault_fd[oldest_vault%VAULT_COUNT]);
-		remove_file(data_dir+"/"+DISK_VAULT_DIR+"/"+std::to_string(oldest_vault));
-		oldest_vault++;
-	}
-	void save_meta() {
-		std::ofstream new_meta_file;
-		auto orig_meta_fname = data_dir+"/"+META_FILE;
-		auto new_meta_fname = orig_meta_fname+".new";
-		new_meta_file.open(new_meta_fname, std::ios::trunc | std::ios::app | std::ios::binary);
-		print_meta_to_file(new_meta_file);
-		new_meta_file.close();
-		rename(new_meta_fname.c_str(), orig_meta_fname.c_str());
-	}
-	void print_meta_to_file(std::ofstream& fout) {
-		fout<<"youngest_vault "<<youngest_vault<<std::endl;
-		fout<<"oldest_vault "<<youngest_vault<<std::endl;
-		fout<<"rw_vault_log_size "<<rw_vault->log_file_size()<<std::endl;
-		fout<<"del_log_size "<<del_mark.log_file_size()<<std::endl;
-		fout<<"bloomfilter_sizes"<<std::endl;
-		for(int row=0; row<ROW_COUNT; row++) {
-			bf256arr.at(row).rent_const([&fout](const bloomfilter256* curr_bf) {
-				auto size = curr_bf->size();
-				fout<<size<<std::endl;
-			});
-		}
+		compactor.done.store(false);
 	}
 public:
 	internalkv(int count_for_bloom, const seeds& s): seeds_for_bloom(s) {
@@ -228,10 +233,8 @@ private:
 		return false;
 	}
 public:
+	bool can_start_compaction(); //TODO
 	void update(btree::btree_multimap<uint64_t, dstr_with_id>* new_vault) {
-		if(compactor.done.load()) {
-			done_compaction();
-		}
 		str_with_id str_and_id;
 		std::vector<uint64_t> del_ids;
 		for(auto iter = new_vault->begin(); iter != new_vault->end(); iter++) {
@@ -240,7 +243,7 @@ public:
 				bool found_it = lookup(iter->first, iter->second.dstr.kstr, &str_and_id);
 				if(found_it) {
 					del_ids.push_back(str_and_id.id);
-					del_mark.log_clear(str_and_id.id);
+					del_mark.log_set(str_and_id.id);
 				}
 			} else {
 				auto& v = iter->second;
@@ -249,15 +252,29 @@ public:
 				rw_vault->log_add_kv(iter->first, v);
 			}
 		}
-		save_meta();
+		del_mark.log_clear(next_id);
+		if(can_start_compaction()) {
+			youngest_vault++;
+			oldest_vault++;
+			rw_vault->flush_log();
+			// new log for del_mark is created, which indicates id-switch
+			del_mark.switch_log(youngest_vault+1);
+			done_compaction();
+			init_compactor();
+		} else {
+			rw_vault->flush_log();
+			del_mark.flush_log();
+		}
+
 		for(int i=0; i < del_ids.size(); i++) {
-			del_mark.clear(del_ids[i]);
+			del_mark.set(del_ids[i]);
 		}
 		for(auto iter = new_vault->begin(); iter != new_vault->end(); iter++) {
 			if(iter->second.id >= 0) {
 				rw_vault->add(iter->first, iter->second);
 			}
 		}
+		del_mark.clear(next_id);
 	}
 };
 
