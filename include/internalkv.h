@@ -235,6 +235,16 @@ private:
 public:
 	bool can_start_compaction(); //TODO
 	void update(btree::btree_multimap<uint64_t, dstr_with_id>* new_vault) {
+		if(can_start_compaction()) {
+			youngest_vault++;
+			oldest_vault++;
+			rw_vault->flush_log();
+			del_mark.log_rw_vault_log_size(compactor.wo_vault->log_file_size());
+			// new log for del_mark is created, which indicates id-switch
+			del_mark.switch_log(youngest_vault+1);
+			done_compaction();
+			init_compactor();
+		}
 		str_with_id str_and_id;
 		std::vector<uint64_t> del_ids;
 		for(auto iter = new_vault->begin(); iter != new_vault->end(); iter++) {
@@ -253,18 +263,10 @@ public:
 			}
 		}
 		del_mark.log_clear(next_id);
-		if(can_start_compaction()) {
-			youngest_vault++;
-			oldest_vault++;
-			rw_vault->flush_log();
-			// new log for del_mark is created, which indicates id-switch
-			del_mark.switch_log(youngest_vault+1);
-			done_compaction();
-			init_compactor();
-		} else {
-			rw_vault->flush_log();
-			del_mark.flush_log();
-		}
+
+		rw_vault->flush_log();
+		del_mark.log_rw_vault_log_size(rw_vault->log_file_size());
+		del_mark.flush_log();
 
 		for(int i=0; i < del_ids.size(); i++) {
 			del_mark.set(del_ids[i]);

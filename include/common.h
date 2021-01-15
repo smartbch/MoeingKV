@@ -13,6 +13,8 @@ enum __const_t {
 	BITS_PER_ENTRY = 20,
 
 	CACHE_SHARD_COUNT = 1024,
+	VALID_ID_START = 2048, // the IDs smaller than this are reserved for special usage.
+	RW_VAULT_LOG_SIZE_TAG = 7, // the IDs smaller than this are reserved for special usage.
 };
 
 #define MEM_VAULT_LOG_DIR ("mvault")

@@ -148,10 +148,14 @@ public:
 	void log_clear(int64_t pos) { //negative for clear
 		log_i64(-pos);
 	}
+	void log_rw_vault_log_size(int64_t size) {
+		log_i64(RW_VAULT_LOG_SIZE_TAG);
+		log_i64(size);
+	}
 	void prune_till(int64_t pos) {
 		vec_of_arr.prune_till(pos>>LEAF_BITS);
 	}
-	bool load_data_from_logs(const std::vector<int>& file_list) {
+	bool load_data_from_logs(const std::vector<int>& file_list, int64_t* rw_vault_log_size) {
 		for(int i=0; i<file_list.size(); i++) {
 			std::string fname = log_dir+"/"+std::to_string(file_list[i]);
 			std::ifstream fin;
@@ -170,7 +174,13 @@ public:
 					std::cerr<<"Failed to read file "<<fname<<std::endl;
 					return false;
 				}
-				if(i64 > 0) { // positive for set
+				if(i64 == RW_VAULT_LOG_SIZE_TAG) {
+					state = read_i64(fin, rw_vault_log_size);
+					if((state & std::ios::failbit ) != 0) {
+						std::cerr<<"Failed to read file "<<fname<<std::endl;
+						return false;
+					}
+				} else if(i64 > 0) { // positive for set
 					set(i64);
 				} else { //negative for clear
 					clear(-i64);
